@@ -1,0 +1,1028 @@
+
+{
+  "AWSTemplateFormatVersion" : "2010-09-09",
+  "Description" : "HA implementation of Chef Server 12 in an existing VPC, with cookbook storage in S3.",
+  "Parameters" : {
+      
+    "KeyName" : {
+      "Description" : "Name of an existing EC2 keypair to enable SSH access to the instances",
+      "Type": "AWS::EC2::KeyPair::KeyName",
+      "ConstraintDescription" : "Must be the name of an existing EC2 KeyPair",
+      "Default": ""
+    },    
+
+    "FrontendSize" : {
+      "Description" : "Number of EC2 instances to launch for the frontend servers",
+      "Type" : "Number",
+      "Default" : "2"
+    },
+
+    "FrontendInstanceType" : {
+      "Description" : "EC2 instance type for front-end server(s)",
+      "Type" : "String",
+      "Default" : "t2.small"
+    },
+
+    "NginxCertificate" : {
+      "Default": "",
+      "Description" : "nginx certificate download link",
+      "Type": "String"
+    },
+
+    "NginxCertificateKey" : {
+      "Default": "",
+      "Description" : "nginx key download link",
+      "Type": "String"
+    },
+
+    "BackendInstanceType" : {
+      "Description" : "EC2 instance type for the backend server",
+      "Type" : "String",
+      "Default" : "t2.medium"
+    },
+
+    "VPC" : {
+      "Description" : "VPC ID to launch the Chef Server into",
+      "Type" : "String",
+      "Default" : "vpc-4d37b028"
+    },
+
+    "PublicSubnet1" : {
+      "Description" : "Public Subnet ID to launch the Chef frontends and Load Balancer",
+      "Type" : "String",
+      "Default" : "subnet-c89c2191"
+    },
+
+    "PublicSubnet2" : {
+      "Description" : "Public Subnet ID to launch the Chef frontends and Load Balancer",
+      "Type" : "String",
+      "Default" : "subnet-66780b03"
+    },
+
+    "PrivateSubnet" : {
+      "Description" : "Private Subnet ID to launch the Chef backend instances",
+      "Type" : "String",
+      "Default" : "subnet-f19c21a8"
+    },
+
+    "PrivateSubnet2" : {
+      "Description" : "Private Subnet ID to launch the Chef frontend instances",
+      "Type" : "String",
+      "Default" : "subnet-41780b24"
+    },
+
+    "Owner" : {
+      "Description" : "Email address of the owner of this service",
+      "Type" : "String",
+      "Default" : ""
+    },
+
+    "CostCode" : {
+      "Description" : "Cost code to bill this service to",
+      "Type" : "String",
+      "Default" : ""
+    },
+
+    "Environment" : {
+      "Description" : "Environment",
+      "Type" : "String",
+      "Default" : "dev-test"
+    },
+
+    "SSHLocation" : {
+      "Description" : "The IP address range that can be used to SSH to the EC2 instances",
+      "Type": "String",
+      "MinLength": "9",
+      "MaxLength": "18",
+      "Default": "0.0.0.0/0",
+      "AllowedPattern": "(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})",
+      "ConstraintDescription": "must be a valid IP CIDR range of the form x.x.x.x/x."
+    },
+
+    "SSLCertificateARN" : {
+      "Default": "",
+      "Description" : "The ARN of the SSL certificate to use.",
+      "Type": "String"
+    }
+  },
+  
+  "Mappings" : {
+
+    "AWSRegionArch2AMI" : {
+      "us-east-1"      : { "32" : "NOT_YET_SUPPORTED", "64" : "ami-52009e3b", "64HVM" : "ami-eec75e87" },
+      "us-west-2"      : { "32" : "NOT_YET_SUPPORTED", "64" : "ami-e030a5d0", "64HVM" : "ami-503bae60" },
+      "us-west-1"      : { "32" : "NOT_YET_SUPPORTED", "64" : "ami-0a2f024f", "64HVM" : "NOT_YET_SUPPORTED" },
+      "eu-west-1"      : { "32" : "NOT_YET_SUPPORTED", "64" : "ami-8aa3a8fe", "64HVM" : "ami-e4d18e93" },
+      "ap-southeast-1" : { "32" : "NOT_YET_SUPPORTED", "64" : "ami-0c034f5e", "64HVM" : "NOT_YET_SUPPORTED" },
+      "ap-southeast-2" : { "32" : "NOT_YET_SUPPORTED", "64" : "ami-f261f0c8", "64HVM" : "NOT_YET_SUPPORTED" },
+      "ap-northeast-1" : { "32" : "NOT_YET_SUPPORTED", "64" : "ami-651a9b64", "64HVM" : "NOT_YET_SUPPORTED" },
+      "sa-east-1"      : { "32" : "NOT_YET_SUPPORTED", "64" : "ami-b32cf7ae", "64HVM" : "NOT_YET_SUPPORTED" }
+    }
+
+  },
+
+  "Resources" : {
+
+    "CfnUser" : {
+      "Type" : "AWS::IAM::User",
+      "Properties" : {
+        "Path": "/",
+        "Policies": [ {
+          "PolicyName": "root",
+          "PolicyDocument": { "Statement": [ {
+            "Effect":"Allow",
+            "Action":"cloudformation:DescribeStackResource",
+            "Resource":"*"
+          } ] }
+        } ]
+      }
+    },
+
+    "CfnAccessKey" : {
+      "Type" : "AWS::IAM::AccessKey",
+      "Properties" : {
+        "UserName" : { "Ref" : "CfnUser" }
+      }
+    },
+
+    "S3User" : {
+      "Type" : "AWS::IAM::User"
+    },
+
+    "S3AccessKey" : {
+      "Type" : "AWS::IAM::AccessKey",
+      "Properties" : {
+        "UserName" : { "Ref" : "S3User" }
+      }
+    },
+
+    "EC2AccessIAMPolicy": {
+        "Type": "AWS::IAM::Policy",
+        "Properties": {
+            "PolicyName": "EC2Access",
+            "PolicyDocument": {
+                "Version" : "2012-10-17",
+                "Statement": [
+                  {
+                    "Action"  :  [
+                                    "ec2:AttachVolume",
+                                    "ec2:CreateVolume",
+                                    "ec2:CreateTags",
+                                    "ec2:DescribeVolumeAttribute",
+                                    "ec2:DescribeVolumeStatus",
+                                    "ec2:DescribeVolumes",
+                                    "ec2:DescribeInstances",
+                                    "ec2:DetachVolume",
+                                    "ec2:EnableVolumeIO",
+                                    "ec2:ImportVolume",
+                                    "ec2:ModifyVolumeAttribute",
+                                    "ec2:DescribeNetworkInterfaces",
+                                    "ec2:AssignPrivateIpAddresses",
+                                    "ec2:UnassignPrivateIpAddresses"
+                                  ],
+                    "Effect"     : "Allow",
+                    "Resource"   : "*"
+                  }
+                ]
+            },
+        "Users": [ { "Ref": "S3User" } ]
+      }
+    },
+
+    "CookbooksBucket" : {
+      "Type" : "AWS::S3::Bucket",
+      "Properties" : {
+        "AccessControl" : "Private"
+      }
+    },
+
+    "CookbooksBucketPolicy" : {
+      "Type" : "AWS::S3::BucketPolicy",
+      "Properties" : {
+        "PolicyDocument": {
+          "Version"      : "2008-10-17",
+          "Id"           : "CookbooksWritePolicy",
+          "Statement"    : [
+            {
+              "Action"     : ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],
+              "Effect"     : "Allow",
+              "Resource"   : { "Fn::Join" : ["", ["arn:aws:s3:::", {"Ref" : "CookbooksBucket"} , "/*"]]},
+              "Principal"  : { "AWS": {"Fn::GetAtt" : ["S3User", "Arn"]} }
+            },
+            {
+              "Action"     : ["s3:ListBucket"],
+              "Effect"     : "Allow",
+              "Resource"   : { "Fn::Join" : ["", ["arn:aws:s3:::", {"Ref" : "CookbooksBucket"}]]},
+              "Principal"  : { "AWS": {"Fn::GetAtt" : ["S3User", "Arn"]} }
+            }
+          ]
+        },
+        "Bucket" : {"Ref" : "CookbooksBucket"}
+      }
+    },
+
+    "ChefDataBucket" : {
+      "Type" : "AWS::S3::Bucket",
+      "Properties" : {
+        "AccessControl" : "Private"
+      }
+    },
+
+    "ChefDataBucketPolicy" : {
+      "Type" : "AWS::S3::BucketPolicy",
+      "Properties" : {
+        "PolicyDocument": {
+          "Version"      : "2008-10-17",
+          "Id"           : "ChefDataPolicy",
+          "Statement"    : [
+            {
+              "Action"     : ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],
+              "Effect"     : "Allow",
+              "Resource"   : { "Fn::Join" : ["", ["arn:aws:s3:::", {"Ref" : "ChefDataBucket"} , "/*"]]},
+              "Principal"  : { "AWS": {"Fn::GetAtt" : ["BackendRole", "Arn"]} }
+            },
+            {
+              "Action"     : ["s3:ListBucket"],
+              "Effect"     : "Allow",
+              "Resource"   : { "Fn::Join" : ["", ["arn:aws:s3:::", {"Ref" : "ChefDataBucket"}]]},
+              "Principal"  : { "AWS": {"Fn::GetAtt" : ["BackendRole", "Arn"]} }
+            }
+          ]
+        },
+        "Bucket" : {"Ref" : "ChefDataBucket"}
+      }
+    },
+
+    "BackendInstanceProfile" : {
+      "Type" : "AWS::IAM::InstanceProfile",
+      "Properties" : {
+        "Path" : "/",
+        "Roles" : [ {
+          "Ref" : "BackendRole"
+        } ]
+      }
+    },
+
+    "BackendRole" : {
+      "Type" : "AWS::IAM::Role",
+      "Properties" : {
+        "AssumeRolePolicyDocument" : {
+          "Statement" : [ {
+            "Effect" : "Allow",
+            "Principal" : {
+              "Service" : [ "ec2.amazonaws.com" ]
+            },
+            "Action" : [ "sts:AssumeRole" ]
+          } ]
+        },
+        "Path" : "/"
+      }
+    },
+
+    "S3AccessIAMPolicy": {
+        "Type": "AWS::IAM::Policy",
+        "Properties": {
+            "PolicyName": "S3Access",
+            "PolicyDocument": {
+                "Version" : "2012-10-17",
+                "Statement": [
+                  {
+                    "Action"     : ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],
+                    "Effect"     : "Allow",
+                    "Resource"   : { "Fn::Join" : ["", ["arn:aws:s3:::", {"Ref" : "ChefDataBucket"} , "/*"]]}
+                  },
+                  {
+                    "Action"     : ["s3:ListBucket"],
+                    "Effect"     : "Allow",
+                    "Resource"   : { "Fn::Join" : ["", ["arn:aws:s3:::", {"Ref" : "ChefDataBucket"}]]}
+                  },
+                  {
+                    "Action"     : ["iam:UploadServerCertificate"],
+                    "Effect"     : "Allow",
+                    "Resource"   : "*"                    
+                  },
+                  {
+                    "Action"     : [
+                      "elasticloadbalancing:SetLoadBalancerListenerSSLCertificate",
+                      "elasticloadbalancing:CreateLoadBalancerListeners",
+                      "elasticloadbalancing:SetLoadBalancerPoliciesOfListener",
+                      "elasticloadbalancing:CreateLBCookieStickinessPolicy"
+                    ],
+                    "Effect"     : "Allow",
+                    "Resource"   : { "Fn::Join" : ["", ["arn:aws:elasticloadbalancing:", {"Ref" : "AWS::Region"}, ":", {"Ref" : "AWS::AccountId"}, ":loadbalancer/", {"Ref" : "PublicElasticLoadBalancer"}]]}
+                  }                  
+                ]
+            },
+        "Roles": [ { "Ref": "BackendRole" } ]
+      }
+    },
+
+    "DataVolume": {
+       "Type":"AWS::EC2::Volume",
+       "Properties" : {
+          "AvailabilityZone" : { "Fn::Join" : ["", [{ "Ref" : "AWS::Region" },"a"] ] },
+          "Size" : "100",
+          "Tags" : [
+            { "Key" : "Name", "Value" : "chef-data" },
+            { "Key" : "owner", "Value" : { "Ref" : "Owner"}},
+            { "Key" : "cost-code", "Value" : { "Ref" : "CostCode"}},
+            { "Key" : "environment", "Value" : { "Ref" : "Environment"}},
+            { "Key" : "role", "Value" : "chef" },
+            { "Key" : "service", "Value" : "chef" }
+          ],
+          "VolumeType" : "gp2"
+       }
+    },
+
+    "VolumeAttachment" : {
+       "Type":"AWS::EC2::VolumeAttachment",
+       "Properties" : {
+          "Device" : "/dev/sdf",
+          "InstanceId" : { "Ref" : "BackendServer" },
+          "VolumeId" : { "Ref" : "DataVolume" }
+       }
+    },
+
+    "BackendServer": {  
+      "Type": "AWS::EC2::Instance",
+      "Metadata" : {
+        "Comment1" : "Configure the backend servers to respond to requests",
+        "AWS::CloudFormation::Init" : {
+          "config" : {
+            "packages" : {
+              "yum" : {
+                "curl"     : [],
+                "wget"     : [],
+                "ntp"      : [],
+                "crontabs" : [],
+                "git"      : [],
+                "freetype" : [],
+                "libpng"   : [],
+                "lvm2"     : []
+              }
+            },
+            "files" : {
+              "/etc/s3cfg": {
+                "content" : { "Fn::Join" : ["", [
+                   "[default]\n",
+                    "access_key = ", { "Ref" : "S3AccessKey" }, "\n",
+                    "secret_key = ", {"Fn::GetAtt": ["S3AccessKey", "SecretAccessKey"]}, "\n",
+                    "use_https = True\n"
+                    ]]},
+                "mode"  : "000600",
+                "owner" : "root",
+                "group" : "root" 
+              },
+              "/etc/yum.repos.d/chef-stable.repo" : {
+                "content": { "Fn::Join" : ["", [
+                  "[chef-stable]\n",
+                  "name=Chef Stable Repo\n",
+                  "baseurl=https://packagecloud.io/chef/stable/el/6/$basearch\n",
+                  "enabled=1\n",
+                  "gpgcheck=0\n",
+                  "gpgkey=https://packagecloud.io/gpg.key\n",
+                  "sslcacert=/etc/pki/tls/certs/ca-bundle.crt\n",
+                  "sslverify=1\n"
+                 ]]},
+                 "mode" : "000644",
+                 "owner": "root",
+                 "group": "root"
+              }
+            },
+            "services": {
+              "sysvinit": {
+                "ntpd": {
+                  "enabled" : "true",
+                  "ensureRunning" : "true"
+                },
+                "iptables": {
+                  "enabled" : "false",
+                  "ensureRunning" : "false"
+                }
+              }
+            }
+          }
+        }
+      },
+      "Properties": {
+        "ImageId" : { "Fn::FindInMap" : [ "AWSRegionArch2AMI", { "Ref" : "AWS::Region" }, "64HVM" ] },
+        "InstanceType"   : { "Ref" : "BackendInstanceType" },
+        "IamInstanceProfile" : { "Ref" : "BackendInstanceProfile" },
+        "NetworkInterfaces" : [
+            {
+               "DeviceIndex" : "0",
+               "SecondaryPrivateIpAddressCount" : 1,
+               "GroupSet" : [ {"Ref" : "BackendSecurityGroup"} ],
+               "SubnetId" : { "Ref": "PrivateSubnet" }
+            }
+        ],
+        "KeyName"        : { "Ref" : "KeyName" },
+        "Tags" : [
+          { "Key" : "Name", "Value" : "chef-server-primary" },
+          { "Key" : "owner", "Value" : { "Ref" : "Owner"}},
+          { "Key" : "cost-code", "Value" : { "Ref" : "CostCode"}},
+          { "Key" : "environment", "Value" : { "Ref" : "Environment"}},
+          { "Key" : "role", "Value" : "chef" },
+          { "Key" : "service", "Value" : "chef" }
+        ],
+        "UserData"       : { "Fn::Base64" : { "Fn::Join" : ["", [
+          "#!/bin/bash -v\n",
+
+          "function error_exit\n",
+          "{\n",
+          "  cfn-signal -e 1 -r \"$1\" '", { "Ref" : "BackendWaitHandle" }, "'\n",
+          "  exit 1\n",
+          "}\n",
+
+          "SHORTNAME=`(curl -s http://169.254.169.254/latest/meta-data/local-hostname)`\n",
+          "LONGNAME=\"$SHORTNAME.ec2.internal\"\n",
+          "PRIVATE_IPV4=`(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)`\n",
+          "MAC=`(curl -s http://169.254.169.254/latest/meta-data/mac)`\n",
+          "IP_LIST=`(curl -s http://169.254.169.254/latest/meta-data/network/interfaces/macs/$MAC/local-ipv4s)`\n",
+          "echo $IP_LIST\n",
+          "arrIN=(${IP_LIST// / })\n",
+          "CLUSTER_VIP=${arrIN[1]}\n",
+
+          "export HOME=\/root\n",
+
+          "easy_install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz\n",
+
+          "hostname $LONGNAME\n",
+          "export PATH=$PATH:/opt/aws/bin\n",
+          "cfn-init ",
+          "    -v -s ", { "Ref" : "AWS::StackName" }, " -r BackendServer ",
+          "         --access-key ", { "Ref" : "CfnAccessKey" },
+          "         --secret-key ", {"Fn::GetAtt": ["CfnAccessKey", "SecretAccessKey"]},
+          "         --region     ", { "Ref" : "AWS::Region" }, " || error_exit 'Failed to run cfn-init'\n",
+
+          "pvcreate /dev/xvdf || error_exit 'Failed to create LVM volume'\n",
+          "vgcreate chef /dev/xvdf || error_exit 'Failed to create LVM volume'\n",
+          "lvcreate -l 85%VG -n data chef || error_exit 'Failed to create LVM volume'\n",
+
+          "## Download the Chef Server installer\n",
+          "yum -y install https://web-dl.packagecloud.io/chef/stable/packages/el/6/chef-server-core-12.1.2-1.el6.x86_64.rpm || error_exit 'Failed to install Chef Server'\n",
+          "yum -y install https://web-dl.packagecloud.io/chef/stable/packages/el/6/chef-ha-1.0.0-1.x86_64.rpm || error_exit 'Failed to install Chef HA'\n",
+
+          "yum -y install jq\n",
+
+          "mkdir -p /var/opt/opscode/drbd/data || error_exit 'Failed to create drdb directory'\n",
+          "mkfs.ext4 /dev/mapper/chef-data || error_exit 'Failed to create EXT4 filesystem'\n",
+          "mount /dev/mapper/chef-data /var/opt/opscode/drbd/data || error_exit 'Failed to mount chef volume'\n",
+
+          "## Generate /etc/opscode/chef-server.rb\n",
+          "mkdir /etc/opscode\n",
+          "mkdir /etc/opscode/frontend\n",
+
+          "echo \"topology 'ha'\" >> /etc/opscode/chef-server.rb\n",
+          "echo \"topology 'ha'\" >> /etc/opscode/frontend/chef-server.rb\n",
+
+          "echo \"ha['provider'] = 'aws'\" >> /etc/opscode/chef-server.rb\n",
+          "echo \"ha['aws_access_key_id'] = '", { "Ref" : "S3AccessKey" }, "'\" >> /etc/opscode/chef-server.rb\n",
+          "echo \"ha['aws_secret_access_key'] = '", {"Fn::GetAtt": ["S3AccessKey", "SecretAccessKey"]}, "'\" >> /etc/opscode/chef-server.rb\n",
+          "echo \"ha['ebs_volume_id'] = '", { "Ref" : "DataVolume" }, "'\" >> /etc/opscode/chef-server.rb\n",
+          "echo \"ha['ebs_device'] = '/dev/xvdf'\" >> /etc/opscode/chef-server.rb\n",
+
+          "echo '' >> /etc/opscode/chef-server.rb\n",
+
+          "echo \"server '$SHORTNAME',\" >> /etc/opscode/chef-server.rb\n",
+          "echo \"  :ipaddress => '$PRIVATE_IPV4',\" >> /etc/opscode/chef-server.rb\n",
+          "echo \"  :role => 'backend',\" >> /etc/opscode/chef-server.rb\n",
+          "echo \"  :bootstrap => true,\" >> /etc/opscode/chef-server.rb\n",
+          "echo \"  :cluster_address => '$CLUSTER_VIP'\" >> /etc/opscode/chef-server.rb\n",
+
+          "echo '' >> /etc/opscode/chef-server.rb\n",
+
+          "echo \"server '", { "Fn::GetAtt" : ["BackendServerSecondary", "PrivateDnsName"] }, "',\" >> /etc/opscode/chef-server.rb\n",
+          "echo \"  :ipaddress => '", { "Fn::GetAtt" : ["BackendServerSecondary", "PrivateIp"] }, "',\" >> /etc/opscode/chef-server.rb\n",
+          "echo \"  :role => 'backend'\" >> /etc/opscode/chef-server.rb\n",
+
+          "echo '' >> /etc/opscode/chef-server.rb\n",
+
+          "echo \"backend_vip '$CLUSTER_VIP',\" >> /etc/opscode/chef-server.rb\n",
+          "echo \"  :ipaddress => '$CLUSTER_VIP',\" >> /etc/opscode/chef-server.rb\n",
+          "echo \"  :device => 'eth0'\" >> /etc/opscode/chef-server.rb\n",
+
+          "echo \"backend_vip '$CLUSTER_VIP',\" >> /etc/opscode/frontend/chef-server.rb\n",
+          "echo \"  :ipaddress => '$CLUSTER_VIP',\" >> /etc/opscode/frontend/chef-server.rb\n",
+          "echo \"  :device => 'eth0'\" >> /etc/opscode/frontend/chef-server.rb\n",
+
+          "echo '' >> /etc/opscode/chef-server.rb\n",
+
+          "echo \"api_fqdn '", { "Fn::GetAtt" : ["PublicElasticLoadBalancer", "DNSName"] }, "'\" >> /etc/opscode/chef-server.rb\n",
+          "echo \"api_fqdn '", { "Fn::GetAtt" : ["PublicElasticLoadBalancer", "DNSName"] }, "'\" >> /etc/opscode/frontend/chef-server.rb\n",
+
+          "#echo \"nginx['ha'] = true\" >> /etc/opscode/frontend/chef-server.rb\n",
+
+          "echo '' >> /etc/opscode/chef-server.rb\n",
+
+          "echo \"bookshelf['enable'] = false\" >> /etc/opscode/chef-server.rb\n",
+          "echo \"bookshelf['vip'] = 's3.amazonaws.com'\" >> /etc/opscode/chef-server.rb\n",
+          "echo \"bookshelf['external_url'] = 'https://s3.amazonaws.com'\" >> /etc/opscode/chef-server.rb\n",
+          "echo \"bookshelf['access_key_id'] = '", { "Ref" : "S3AccessKey" }, "'\" >> /etc/opscode/chef-server.rb\n",
+          "echo \"bookshelf['secret_access_key'] = '", {"Fn::GetAtt": ["S3AccessKey", "SecretAccessKey"]}, "'\" >> /etc/opscode/chef-server.rb\n",
+          "echo \"opscode_erchef['s3_bucket'] = '", { "Ref" : "CookbooksBucket" }, "'\" >> /etc/opscode/chef-server.rb\n",
+
+          "echo '' >> /etc/opscode/chef-server.rb\n",
+
+          "if [ x", { "Ref" : "NginxCertificate" }, " != x ] && [ x", { "Ref" : "NginxCertificateKey" }, " != x ]; then \n",
+          "  wget \"", { "Ref" : "NginxCertificate" }, "\" -O /etc/pki/tls/certs/chef-server.crt\n",
+          "  wget \"", { "Ref" : "NginxCertificateKey" }, "\" -O /etc/pki/tls/private/chef-server.key\n",
+          "  chmod 644 /etc/pki/tls/certs/chef-server.crt\n",
+          "  chmod 400 /etc/pki/tls/private/chef-server.key\n",
+          "  echo \"nginx['ssl_certificate']  = '/etc/pki/tls/certs/chef-server.crt'\" >> /etc/opscode/chef-server.rb\n",
+          "  echo \"nginx['ssl_certificate_key']  = '/etc/pki/tls/private/chef-server.key'\" >> /etc/opscode/chef-server.rb\n",
+          "fi\n",
+
+          "echo \"$PRIVATE_IPV4 $SHORTNAME $LONGNAME\" >> /etc/hosts\n",
+
+          "chef-server-ctl reconfigure >> /var/log/chef-install.log\n",
+
+          "# Copy /etc/opscode pieces to S3 bucket\n",
+          "aws s3 cp /etc/opscode/ s3://", {"Ref" : "ChefDataBucket" } ,"/ --recursive --include '*' >> /var/log/chef-install.log 2>&1 || error_exit 'Failed to put Chef Server files'\n",
+
+          "aws s3 cp /var/opt/opscode/nginx/ca/ s3://", {"Ref" : "ChefDataBucket" } ,"/certs/ --recursive --include '*' >> /var/log/chef-install.log 2>&1 || error_exit 'Failed to put Chef certificate files'\n",
+
+          "if [ x", { "Ref" : "NginxCertificate" }, " = x ] && [ x", { "Ref" : "NginxCertificateKey" }, " = x ]; then \n",
+          "  SSL_ARN=`aws iam upload-server-certificate --server-certificate-name ", { "Fn::GetAtt" : ["PublicElasticLoadBalancer", "DNSName"] }, " --certificate-body file:///var/opt/opscode/nginx/ca/", { "Fn::GetAtt" : ["PublicElasticLoadBalancer", "DNSName"] }, ".crt --private-key file:///var/opt/opscode/nginx/ca/", { "Fn::GetAtt" : ["PublicElasticLoadBalancer", "DNSName"] }, ".key | jq -r .ServerCertificateMetadata.Arn` >> /var/log/chef-install.log 2>&1 || error_exit 'Failed to upload Chef ELB certificate files'\n",
+          "  export AWS_DEFAULT_REGION=", { "Ref" : "AWS::Region" } ,"\n",
+          "  sleep 10\n",
+          "  aws elb create-load-balancer-listeners --load-balancer-name ", { "Ref" : "PublicElasticLoadBalancer" } ," --listeners \"Protocol=HTTPS,LoadBalancerPort=443,InstanceProtocol=HTTPS,InstancePort=443,SSLCertificateId=$SSL_ARN\" || error_exit 'Failed to create Chef ELB listener'\n",
+          "  aws elb create-lb-cookie-stickiness-policy --load-balancer-name ", { "Ref" : "PublicElasticLoadBalancer" } ," --policy-name LBCookieStickinessPolicy --cookie-expiration-period 3600 || error_exit 'Failed to create ELB Stickiness Policy'\n",
+          "  aws elb set-load-balancer-policies-of-listener --load-balancer-name ", { "Ref" : "PublicElasticLoadBalancer" } ," --load-balancer-port 443 --policy-names LBCookieStickinessPolicy || error_exit 'Failed to set Chef ELB Stickiness Policy'\n",
+          "fi\n",
+
+          "sleep 90\n",
+
+          "chef-server-ctl ha-status\n",
+          
+          "# Handle some common cases\n",
+          "if [ $? = 7 ]; then \n",
+          "  chef-server-ctl start opscode-chef-mover >> /var/log/chef-install.log\n",
+          "fi\n",
+
+          "chef-server-ctl ha-status\n",
+
+          "# Force a master recover\n",
+          "if [ $? != 0 ]; then \n",
+          "  chef-server-ctl master-recover >> /var/log/chef-install.log\n",
+          "  sleep 30\n",
+          "fi\n",
+
+          "chef-server-ctl ha-status >> /var/log/chef-install.log 2>&1 || error_exit 'Backend Primary Server ERROR'\n",
+
+          "# If all went well, signal success\n",
+          "cfn-signal -e $? -r 'Chef backend server configuration' '", { "Ref" : "BackendWaitHandle" }, "'\n"
+        ]]}}        
+      }
+    },
+
+    "BackendServerSecondary": {  
+      "Type": "AWS::EC2::Instance",
+      "Metadata" : {
+        "Comment1" : "Configure the backend servers to respond to requests",
+        "AWS::CloudFormation::Init" : {
+          "config" : {
+            "packages" : {
+              "yum" : {
+                "curl"     : [],
+                "wget"     : [],
+                "ntp"      : [],
+                "crontabs" : [],
+                "git"      : [],
+                "freetype" : [],
+                "libpng"   : [],
+                "lvm2"     : []
+              }
+            },
+            "files" : {
+              "/etc/yum.repos.d/chef-stable.repo" : {
+                "content": { "Fn::Join" : ["", [
+                  "[chef-stable]\n",
+                  "name=Chef Stable Repo\n",
+                  "baseurl=https://packagecloud.io/chef/stable/el/6/$basearch\n",
+                  "enabled=1\n",
+                  "gpgcheck=0\n",
+                  "gpgkey=https://packagecloud.io/gpg.key\n",
+                  "sslcacert=/etc/pki/tls/certs/ca-bundle.crt\n",
+                  "sslverify=1\n"
+                 ]]},
+                 "mode" : "000644",
+                 "owner": "root",
+                 "group": "root"
+              }
+            },
+            "services": {
+              "sysvinit": {
+                "ntpd": {
+                  "enabled" : "true",
+                  "ensureRunning" : "true"
+                },
+                "iptables": {
+                  "enabled" : "false",
+                  "ensureRunning" : "false"
+                }
+              }
+            }
+          }
+        }
+      },
+      "Properties": {
+        "ImageId" : { "Fn::FindInMap" : [ "AWSRegionArch2AMI", { "Ref" : "AWS::Region" }, "64HVM" ] },
+        "InstanceType"   : { "Ref" : "BackendInstanceType" },
+        "IamInstanceProfile" : { "Ref" : "BackendInstanceProfile" },
+        "KeyName"        : { "Ref" : "KeyName" },
+        "SecurityGroupIds" : [ {"Ref" : "BackendSecurityGroup"} ],
+        "SubnetId": { "Ref": "PrivateSubnet" },
+        "Tags" : [
+          { "Key" : "Name", "Value" : "chef-server-secondary" },
+          { "Key" : "owner", "Value" : { "Ref" : "Owner"}},
+          { "Key" : "cost-code", "Value" : { "Ref" : "CostCode"}},
+          { "Key" : "environment", "Value" : { "Ref" : "Environment"}},
+          { "Key" : "role", "Value" : "chef" },
+          { "Key" : "service", "Value" : "chef" }
+        ],
+        "UserData"       : { "Fn::Base64" : { "Fn::Join" : ["", [
+          "#!/bin/bash -v\n",
+
+          "function error_exit\n",
+          "{\n",
+          "  cfn-signal -e 1 -r \"$1\" '", { "Ref" : "BackendWaitHandle" }, "'\n",
+          "  exit 1\n",
+          "}\n",
+
+          "SHORTNAME=`(curl -s http://169.254.169.254/latest/meta-data/local-hostname)`\n",
+          "LONGNAME=\"$SHORTNAME.ec2.internal\"\n",
+          "PRIVATE_IPV4=`(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)`\n",
+
+          "export HOME=\/root\n",
+
+          "easy_install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz\n",
+
+          "hostname $LONGNAME\n",
+          "export PATH=$PATH:/opt/aws/bin\n",
+          "cfn-init ",
+          "    -v -s ", { "Ref" : "AWS::StackName" }, " -r BackendServer ",
+          "         --access-key ", { "Ref" : "CfnAccessKey" },
+          "         --secret-key ", {"Fn::GetAtt": ["CfnAccessKey", "SecretAccessKey"]},
+          "         --region     ", { "Ref" : "AWS::Region" }, " || error_exit 'Failed to run cfn-init'\n",
+
+          "## Download the Chef Server installer\n",
+          "yum -y install https://web-dl.packagecloud.io/chef/stable/packages/el/6/chef-server-core-12.1.2-1.el6.x86_64.rpm || error_exit 'Failed to install Chef Server'\n",
+          "yum -y install https://web-dl.packagecloud.io/chef/stable/packages/el/6/chef-ha-1.0.0-1.x86_64.rpm || error_exit 'Failed to install Chef HA'\n",
+
+          "mkdir /etc/opscode\n",
+
+          "# Check we have access to the S3 bucket\n",
+          "aws s3 ls s3://", {"Ref" : "ChefDataBucket" } ,"/ >> /var/log/chef-install.log 2>&1 || error_exit 'Failed to access Chef S3 bucket'\n",
+
+          "mkdir -p /var/opt/opscode/nginx/ca\n",
+          "while [[ ! -s /etc/opscode/chef-server.rb ]] ;",
+          "do aws s3 cp s3://", {"Ref" : "ChefDataBucket" } ,"/ /etc/opscode/ --recursive --include '*';",
+          "sleep 5;",
+          "done\n",
+
+          "# Run another s3 copy to make sure we get all the files. Otherwise we might end up with a partial list.\n",
+          "aws s3 cp s3://", {"Ref" : "ChefDataBucket" } ,"/ /etc/opscode/ --recursive --include '*'\n",
+
+          "# Get the Nginx certificates\n",
+          "aws s3 cp s3://", {"Ref" : "ChefDataBucket" } ,"/certs/ /var/opt/opscode/nginx/ca/ --recursive --include '*'\n",
+
+          "echo \"$PRIVATE_IPV4 $SHORTNAME $LONGNAME\" >> /etc/hosts\n",
+
+          "chef-server-ctl reconfigure >> /var/log/chef-install.log\n",
+
+          "sleep 90\n",
+
+          "chef-server-ctl ha-status\n",
+
+          "# Force a backup recover\n",
+          "if [ $? != 0 ]; then \n",
+          "  chef-server-ctl backup-recover >> /var/log/chef-install.log\n",
+          "  sleep 30\n",
+          "fi\n",
+
+          "chef-server-ctl ha-status >> /var/log/chef-install.log 2>&1 || error_exit 'Backend Secondary Server ERROR'\n",
+
+          "# If all went well, signal success\n",
+          "cfn-signal -e $? -r 'Chef backend server configuration' '", { "Ref" : "BackendWaitHandle" }, "'\n"
+        ]]}}
+      }
+    },
+
+    "BackendSecurityGroup" : {
+      "Type" : "AWS::EC2::SecurityGroup",
+      "Properties" : {
+        "GroupDescription" : "Allow access from frontend security group and bastion as well as outbound HTTP and HTTPS traffic",
+        "VpcId" : { "Ref" : "VPC" },
+        "SecurityGroupIngress" : [
+          {"IpProtocol" : "tcp", "FromPort" : "80", "ToPort" : "80", "SourceSecurityGroupId" : {"Ref" : "FrontendSecurityGroup" }},
+          {"IpProtocol" : "tcp", "FromPort" : "443", "ToPort" : "443", "SourceSecurityGroupId" : {"Ref" : "FrontendSecurityGroup" }},
+          {"IpProtocol" : "tcp", "FromPort" : "4321", "ToPort" : "4321", "SourceSecurityGroupId" : {"Ref" : "FrontendSecurityGroup" }},
+          {"IpProtocol" : "tcp", "FromPort" : "4369", "ToPort" : "4369", "SourceSecurityGroupId" : {"Ref" : "FrontendSecurityGroup" }},
+          {"IpProtocol" : "tcp", "FromPort" : "5140", "ToPort" : "5140", "SourceSecurityGroupId" : {"Ref" : "FrontendSecurityGroup" }},
+          {"IpProtocol" : "tcp", "FromPort" : "5432", "ToPort" : "5432", "SourceSecurityGroupId" : {"Ref" : "FrontendSecurityGroup" }},
+          {"IpProtocol" : "tcp", "FromPort" : "5672", "ToPort" : "5672", "SourceSecurityGroupId" : {"Ref" : "FrontendSecurityGroup" }},
+          {"IpProtocol" : "tcp", "FromPort" : "5984", "ToPort" : "5984", "SourceSecurityGroupId" : {"Ref" : "FrontendSecurityGroup" }},
+          {"IpProtocol" : "tcp", "FromPort" : "6379", "ToPort" : "6379", "SourceSecurityGroupId" : {"Ref" : "FrontendSecurityGroup" }},
+          {"IpProtocol" : "tcp", "FromPort" : "7788", "ToPort" : "7788", "SourceSecurityGroupId" : {"Ref" : "FrontendSecurityGroup" }},
+          {"IpProtocol" : "tcp", "FromPort" : "8000", "ToPort" : "8000", "SourceSecurityGroupId" : {"Ref" : "FrontendSecurityGroup" }},
+          {"IpProtocol" : "tcp", "FromPort" : "8983", "ToPort" : "8983", "SourceSecurityGroupId" : {"Ref" : "FrontendSecurityGroup" }},
+          {"IpProtocol" : "tcp", "FromPort" : "9000", "ToPort" : "9000", "SourceSecurityGroupId" : {"Ref" : "FrontendSecurityGroup" }},
+          {"IpProtocol" : "tcp", "FromPort" : "9460", "ToPort" : "9460", "SourceSecurityGroupId" : {"Ref" : "FrontendSecurityGroup" }},
+          {"IpProtocol" : "tcp", "FromPort" : "9462", "ToPort" : "9463", "SourceSecurityGroupId" : {"Ref" : "FrontendSecurityGroup" }},
+          {"IpProtocol" : "tcp", "FromPort" : "9465", "ToPort" : "9466", "SourceSecurityGroupId" : {"Ref" : "FrontendSecurityGroup" }},
+          {"IpProtocol" : "tcp", "FromPort" : "9670", "ToPort" : "9672", "SourceSecurityGroupId" : {"Ref" : "FrontendSecurityGroup" }},
+          {"IpProtocol" : "tcp", "FromPort" : "9680", "ToPort" : "9680", "SourceSecurityGroupId" : {"Ref" : "FrontendSecurityGroup" }},
+          {"IpProtocol" : "tcp", "FromPort" : "9683", "ToPort" : "9683", "SourceSecurityGroupId" : {"Ref" : "FrontendSecurityGroup" }},
+          {"IpProtocol" : "tcp", "FromPort" : "9685", "ToPort" : "9685", "SourceSecurityGroupId" : {"Ref" : "FrontendSecurityGroup" }},
+          {"IpProtocol" : "tcp", "FromPort" : "16379", "ToPort" : "16379", "SourceSecurityGroupId" : {"Ref" : "FrontendSecurityGroup" }},
+          {"IpProtocol" : "tcp", "FromPort" : "22", "ToPort" : "22", "CidrIp" : {"Ref" : "SSHLocation" } } ],
+        "SecurityGroupEgress" : [
+          { "IpProtocol" : "tcp", "FromPort" : "80",  "ToPort" : "80",  "CidrIp" : "0.0.0.0/0" } ,
+          { "IpProtocol" : "tcp", "FromPort" : "443", "ToPort" : "443", "CidrIp" : "0.0.0.0/0" } ]
+      }
+    },
+
+    "AllowICMPingress" : {
+      "Type" : "AWS::EC2::SecurityGroupIngress",
+      "Properties" : {
+         "GroupId" : { "Ref" : "BackendSecurityGroup" },
+         "IpProtocol" : "-1",
+         "SourceSecurityGroupId" : { "Ref" : "BackendSecurityGroup" }
+      }
+    },
+
+    "AllowICMPegress" : {
+      "Type" : "AWS::EC2::SecurityGroupEgress",
+      "Properties" : {
+         "GroupId" : { "Ref" : "BackendSecurityGroup" },
+         "IpProtocol" : "-1",
+         "DestinationSecurityGroupId" : { "Ref" : "BackendSecurityGroup" }
+      }
+    },
+
+    "BackendWaitHandle" : {
+      "Type" : "AWS::CloudFormation::WaitConditionHandle"
+    },
+
+    "BackendWaitCondition" : {
+      "Type" : "AWS::CloudFormation::WaitCondition",
+      "DependsOn" : "BackendServer",
+      "Properties" : {
+        "Handle"  : { "Ref" : "BackendWaitHandle" },
+        "Timeout" : "1200",
+        "Count"   : "2"
+      }
+    },
+
+    "PublicElasticLoadBalancer" : {
+      "Type" : "AWS::ElasticLoadBalancing::LoadBalancer",
+      "Properties" : {
+        "SecurityGroups" : [ { "Ref" : "PublicLoadBalancerSecurityGroup" } ],
+        "Subnets" : [ { "Ref" : "PublicSubnet1" }, { "Ref" : "PublicSubnet2" } ],
+        "LBCookieStickinessPolicy" : [
+          {
+            "PolicyName" : "PublicELBCookieStickinessPolicy",
+            "CookieExpirationPeriod" : "3600"
+          }
+        ],        
+        "Listeners" : [
+          { 
+            "LoadBalancerPort" : "80",
+            "InstancePort" : "80",
+            "Protocol" : "HTTP"
+          }
+        ],
+        "HealthCheck" : {
+          "Target" : "HTTPS:443/humans.txt",
+          "HealthyThreshold" : "3",
+          "UnhealthyThreshold" : "4",
+          "Interval" : "90",
+          "Timeout" : "60"
+        },
+        "LoadBalancerName" : { "Fn::Join" : ["-", ["chef", { "Ref" : "Environment" } ]] },
+        "Tags" : [
+          { "Key" : "Name", "Value" : "chef-server-elb" },
+          { "Key" : "owner", "Value" : { "Ref" : "Owner"}},
+          { "Key" : "cost-code", "Value" : { "Ref" : "CostCode"}},
+          { "Key" : "environment", "Value" : { "Ref" : "Environment"}},
+          { "Key" : "role", "Value" : "chef" },
+          { "Key" : "service", "Value" : "chef" }
+        ]
+      }
+    },
+
+    "PublicLoadBalancerSecurityGroup" : {
+      "Type" : "AWS::EC2::SecurityGroup",
+      "Properties" : {
+        "GroupDescription" : "Public ELB Security Group with HTTP/HTTPS access on port 80/443 from the internet",
+        "VpcId" : { "Ref" : "VPC" },
+        "SecurityGroupIngress" : [ { "IpProtocol" : "tcp", "FromPort" : "80", "ToPort" : "80", "CidrIp" : "0.0.0.0/0"}, { "IpProtocol" : "tcp", "FromPort" : "443", "ToPort" : "443", "CidrIp" : "0.0.0.0/0"} ],
+        "SecurityGroupEgress" : [ { "IpProtocol" : "tcp", "FromPort" : "80", "ToPort" : "80", "CidrIp" : "0.0.0.0/0"}, { "IpProtocol" : "tcp", "FromPort" : "443", "ToPort" : "443", "CidrIp" : "0.0.0.0/0"} ]
+      }
+    },
+
+    "FrontendFleet" : {
+      "Type" : "AWS::AutoScaling::AutoScalingGroup",
+      "Properties" : {
+        "VPCZoneIdentifier" : [ { "Ref" : "PrivateSubnet" } ],
+        "LaunchConfigurationName" : { "Ref" : "FrontendServerLaunchConfig"  },
+        "MinSize" : "1",
+        "MaxSize" : "10",
+        "DesiredCapacity" : { "Ref" : "FrontendSize" },
+        "LoadBalancerNames" : [ { "Ref" : "PublicElasticLoadBalancer" } ],
+        "Tags" : [ 
+              { "Key" : "Name", "Value" : "chef-server-frontend", "PropagateAtLaunch" : "true" },
+              { "Key" : "owner", "Value" : { "Ref" : "Owner"}, "PropagateAtLaunch" : "true" },
+              { "Key" : "cost-code", "Value" : { "Ref" : "CostCode"}, "PropagateAtLaunch" : "true" },
+              { "Key" : "environment", "Value" : { "Ref" : "Environment"}, "PropagateAtLaunch" : "true" },
+              { "Key" : "role", "Value" : "chef", "PropagateAtLaunch" : "true" },
+              { "Key" : "service", "Value" : "chef", "PropagateAtLaunch" : "true" }
+        ]
+      }
+    },
+
+    "FrontendServerLaunchConfig"  : {
+      "Type" : "AWS::AutoScaling::LaunchConfiguration",
+      "Metadata" : {
+        "Comment1" : "Configure the bootstrap helpers to install Enterprise Chef front-end servers",
+        "AWS::CloudFormation::Init" : {
+          "config" : {
+            "packages" : {
+              "yum" : {
+                "curl"     : [],
+                "wget"     : [],
+                "ntp"      : [],
+                "crontabs" : [],
+                "git"      : [],
+                "freetype" : [],
+                "libpng"   : [],
+                "gcc"      : []
+              }
+            },
+            "files" : {
+              "/etc/yum.repos.d/chef-stable.repo" : {
+                "content": { "Fn::Join" : ["", [
+                  "[chef-stable]\n",
+                  "name=Chef Stable Repo\n",
+                  "baseurl=https://packagecloud.io/chef/stable/el/6/$basearch\n",
+                  "enabled=1\n",
+                  "gpgcheck=0\n",
+                  "gpgkey=https://packagecloud.io/gpg.key\n",
+                  "sslcacert=/etc/pki/tls/certs/ca-bundle.crt\n",
+                  "sslverify=1\n"
+                 ]]},
+                 "mode" : "000644",
+                 "owner": "root",
+                 "group": "root"
+              }
+            },
+            "services": {
+              "sysvinit": {
+                "ntpd": {
+                  "enabled" : "true",
+                  "ensureRunning" : "true"
+                }
+              }
+            }
+          }
+        }
+      },
+      "Properties": {
+        "ImageId" : { "Fn::FindInMap" : [ "AWSRegionArch2AMI", { "Ref" : "AWS::Region" }, "64HVM" ] },
+        "InstanceType"   : { "Ref" : "FrontendInstanceType" },
+        "IamInstanceProfile" : { "Ref" : "BackendInstanceProfile" },
+        "SecurityGroups" : [ {"Ref" : "FrontendSecurityGroup"} ],
+        "KeyName"        : { "Ref" : "KeyName" },
+        "UserData"       : { "Fn::Base64" : { "Fn::Join" : ["", [
+          "#!/bin/bash -v\n",
+
+          "function error_exit\n",
+          "{\n",
+          "  cfn-signal -e 1 -r \"$1\" '", { "Ref" : "FrontendWaitHandle" }, "'\n",
+          "  exit 1\n",
+          "}\n",
+
+          "SHORTNAME=`(curl -s http://169.254.169.254/latest/meta-data/local-hostname)`\n",
+          "LONGNAME=\"$SHORTNAME.ec2.internal\"\n",
+          "PRIVATE_IPV4=`(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)`\n",
+
+          "export HOME=\/root\n",
+          "hostname $LONGNAME\n",
+
+          "easy_install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz\n",
+
+          "export PATH=$PATH:/opt/aws/bin\n",
+          "cfn-init ",
+          "    -v -s ", { "Ref" : "AWS::StackName" }, " -r FrontendServerLaunchConfig ",
+          "         --access-key ", { "Ref" : "CfnAccessKey" },
+          "         --secret-key ", {"Fn::GetAtt": ["CfnAccessKey", "SecretAccessKey"]},
+          "         --region     ", { "Ref" : "AWS::Region" }, " || error_exit 'Failed to run cfn-init'\n",
+
+          "## Download the Chef Server installer\n",
+          "yum -y install https://web-dl.packagecloud.io/chef/stable/packages/el/6/chef-server-core-12.1.2-1.el6.x86_64.rpm || error_exit 'Failed to install Chef Server'\n",
+          "yum -y install https://web-dl.packagecloud.io/chef/stable/packages/el/6/opscode-manage-1.21.0-1.el6.x86_64.rpm || error_exit 'Failed to install Chef Manage'\n",
+
+          "## Generate /etc/opscode/chef-server.rb\n",
+          "mkdir /etc/opscode\n",
+
+          "# Check we have access to the S3 bucket\n",
+          "aws s3 ls s3://", {"Ref" : "ChefDataBucket" } ,"/ >> /var/log/chef-install.log 2>&1 || error_exit 'Failed to access Chef S3 bucket'\n",
+
+          "while [[ ! -s /etc/opscode/chef-server.rb ]] ;",
+          "do aws s3 cp s3://", {"Ref" : "ChefDataBucket" } ,"/ /etc/opscode/ --recursive --include '*';",
+          "sleep 5;",
+          "done\n",
+
+          "# Run another s3 copy to make sure we get all the files. Otherwise we might end up with a partial list.\n",
+          "aws s3 cp s3://", {"Ref" : "ChefDataBucket" } ,"/ /etc/opscode/ --recursive --include '*'\n",
+
+          "# Overwrite chef-server.rb with a slimmed down version for frontends.\n",
+          "aws s3 cp s3://", {"Ref" : "ChefDataBucket" } ,"/frontend/ /etc/opscode/ --recursive --include '*'\n",
+          
+          "mkdir -p /var/opt/opscode/nginx/ca\n",
+          "# Get the Nginx certificates\n",
+          "aws s3 cp s3://", {"Ref" : "ChefDataBucket" } ,"/certs/ /var/opt/opscode/nginx/ca/ --recursive --include '*'\n",
+
+          "echo \"server '$SHORTNAME',\" >> /etc/opscode/chef-server.rb\n",
+          "echo \"  :ipaddress => '$PRIVATE_IPV4',\" >> /etc/opscode/chef-server.rb\n",
+          "echo \"  :role => 'frontend'\" >> /etc/opscode/chef-server.rb\n",
+
+          "echo \"$PRIVATE_IPV4 $SHORTNAME $LONGNAME\" >> /etc/hosts\n",
+
+          "chef-server-ctl reconfigure >> /var/log/chef-install.log 2>&1\n",
+
+          "chef-server-ctl start >> /var/log/chef-install.log 2>&1\n",
+
+          "opscode-manage-ctl reconfigure >> /var/log/chef-install.log 2>&1\n",
+
+          "chef-server-ctl user-create admin Admin User admin@admin.io abc123 --filename /root/admin.pem >> /var/log/chef-install.log 2>&1\n",
+
+          "# If user exists do not go further\n",
+          "if [ $? = 0 ]; then \n",
+          "  chef-server-ctl org-create my-org 'My Org.' --association_user admin --filename /root/my-org-validator.pem >> /var/log/chef-install.log 2>&1\n",
+          "  mkdir /root/keys\n",
+          "  mv /root/*.pem /root/keys/\n",
+          "  # Copy keys to S3 bucket\n",
+          "  aws s3 cp /root/keys/ s3://", {"Ref" : "ChefDataBucket" } ,"/keys/ --recursive --include '*.pem' >> /var/log/chef-install.log 2>&1 || error_exit 'Failed to put private keys'\n",          
+          "  chef-server-ctl reconfigure >> /var/log/chef-install.log 2>&1\n",
+          "fi\n",
+
+          "sleep 1\n",
+
+          "# If all went well, signal success\n",
+          "cfn-signal -e $? -r 'Chef frontend server configuration' '", { "Ref" : "FrontendWaitHandle" }, "'\n"
+        ]]}}
+      }
+    },
+
+    "FrontendSecurityGroup" : {
+      "Type" : "AWS::EC2::SecurityGroup",
+      "Properties" : {
+        "GroupDescription" : "Allow access from load balancer and bastion as well as outbound HTTP and HTTPS traffic",
+        "VpcId" : { "Ref" : "VPC" },
+        "SecurityGroupIngress" : [
+          { "IpProtocol" : "tcp", "FromPort" : "80", "ToPort" : "80", "SourceSecurityGroupId" : { "Ref" : "PublicLoadBalancerSecurityGroup" } } ,
+          { "IpProtocol" : "tcp", "FromPort" : "443", "ToPort" : "443", "SourceSecurityGroupId" : { "Ref" : "PublicLoadBalancerSecurityGroup" } } ,
+          { "IpProtocol" : "tcp", "FromPort" : "22", "ToPort" : "22", "CidrIp" : { "Ref" : "SSHLocation" } } ],
+        "SecurityGroupEgress" : [
+           { "IpProtocol" : "tcp", "FromPort" : "80",  "ToPort" : "80",  "CidrIp" : "0.0.0.0/0" },
+           { "IpProtocol" : "tcp", "FromPort" : "443", "ToPort" : "443", "CidrIp" : "0.0.0.0/0" }
+        ]
+       }
+    },
+
+    "FrontendToBackendSecurityGroupEgress" : {
+      "Type": "AWS::EC2::SecurityGroupEgress",
+      "Properties": {
+        "GroupId": { "Ref": "FrontendSecurityGroup" },
+        "IpProtocol": "tcp",
+        "FromPort": "4321",
+        "ToPort": "16379",
+        "DestinationSecurityGroupId": {"Ref" : "BackendSecurityGroup" }
+      }
+    },
+
+    "FrontendWaitHandle" : {
+      "Type" : "AWS::CloudFormation::WaitConditionHandle"
+    },
+
+    "FrontendWaitCondition" : {
+      "Type" : "AWS::CloudFormation::WaitCondition",
+      "DependsOn" : "FrontendFleet",
+      "Properties" : {
+        "Handle"  : { "Ref" : "FrontendWaitHandle" },
+        "Timeout" : "1500",
+        "Count"   : { "Ref" : "FrontendSize" }
+      }
+    }
+    
+  },
+  
+  "Outputs" : {
+    "ChefServerURL" : {
+      "Value" : { "Fn::Join" : ["", ["https://", { "Fn::GetAtt" : [ "PublicElasticLoadBalancer", "DNSName" ]}]] },
+      "Description" : "URL for new Chef server"
+    }
+  }
+}
